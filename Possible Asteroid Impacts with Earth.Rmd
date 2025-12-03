@@ -1,0 +1,934 @@
+---
+title: "Possible Asteroid Impacts with Earth"
+author: "Dimas Pasha Akrilian"
+date: "2025-11-26"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Pakage 
+```{r}
+install.packages(c(
+  "tidyverse",  # dplyr, readr, stringr, dll (manipulasi data)
+  "caret",      # train-test split, scaling, evaluasi model
+  "glmnet",     # logistic regression dengan regularisasi (mirip penalty L1/L2 di Python)
+  "pROC"        # hitung AUC & plot ROC
+))
+```
+```{r}
+install.packages("smotefamily")  # untuk SMOTE (nanti bisa ditambah)
+```
+
+# Load Data
+```{r}
+# Load package untuk membaca CSV
+library(readr)
+
+# Path file dataset (sesuaikan dengan laptopmu)
+PATH_IMPACTS <- "D:/KULIAH UNNES/Komputasi Statistika/Possible Asteroid Impacts with Earth/archive/impacts.csv"
+PATH_ORBITS  <- "D:/KULIAH UNNES/Komputasi Statistika/Possible Asteroid Impacts with Earth/archive/orbits.csv"
+
+# Load data
+impacts <- read_csv(PATH_IMPACTS, show_col_types = FALSE)
+orbits  <- read_csv(PATH_ORBITS,  show_col_types = FALSE)
+
+# Print ukuran data
+cat("impacts.csv shape :", dim(impacts)[1], "rows,", dim(impacts)[2], "cols\n")
+cat("orbits.csv shape  :", dim(orbits)[1], "rows,", dim(orbits)[2], "cols\n")
+```
+
+Standardisasi Nama Kolom Key
+```{r}
+
+# Fungsi build_obj_key 
+
+build_obj_key <- function(s) {
+  # ubah ke character
+  s <- as.character(s)
+  
+  # ganti non-breaking space dengan spasi biasa
+  s <- gsub("\u00A0", " ", s, fixed = TRUE)
+  
+  # buang spasi awal/akhir
+  s <- trimws(s)
+  
+  # kalau ada teks dalam kurung → ambil isi dalam kurung
+  # contoh: "230089 (2000 WP148)" → "2000 WP148"
+  if (grepl("\\(", s) && grepl("\\)", s)) {
+    s <- sub(".*\\((.*)\\).*", "\\1", s)
+  }
+  
+  # buang sisa tanda kurung kalau masih ada
+  s <- gsub("\\(", "", s)
+  s <- gsub("\\)", "", s)
+  
+  # rapikan spasi berlebih → satu spasi saja
+  s <- gsub("\\s+", " ", s)
+  s <- trimws(s)
+  
+  return(s)
+}
+
+# Terapkan ke dataset
+if ("Object Name" %in% names(impacts) &&
+    "Object Name" %in% names(orbits)) {
+  
+  impacts$obj_key <- sapply(impacts$`Object Name`, build_obj_key)
+  orbits$obj_key  <- sapply(orbits$`Object Name`,  build_obj_key)
+  
+} else {
+  stop("Kolom 'Object Name' tidak ditemukan di salah satu dataset.")
+}
+
+```
+
+Merge Dataset
+```{r}
+# MERGE impacts + orbits 
+
+library(dplyr)
+
+# Hapus kolom "Object Name" dari orbits untuk hindari duplikasi
+orbits_clean <- orbits %>% 
+  select(-`Object Name`)
+
+# Merge (left join) berdasarkan obj_key
+df <- impacts %>%
+  left_join(orbits_clean, by = "obj_key", suffix = c("_imp", "_orb"))
+
+cat("=== MERGE Completed ===\n")
+cat("Merged DataFrame shape:", nrow(df), "rows,", ncol(df), "cols\n\n")
+
+# Hitung total missing values setelah merge
+missing_after_merge <- sum(is.na(df))
+cat("Total Missing Values After Merge:", missing_after_merge, "\n\n")
+
+# Missing per kolom
+cat("Missing per column:\n")
+print(colSums(is.na(df)))
+```
+```{r}
+library(dplyr)
+
+df_clean <- df %>% 
+  filter(if_all(everything(), ~ !is.na(.x))) %>% 
+  as.data.frame()
+
+cat("df_clean shape :", nrow(df_clean), "rows,", ncol(df_clean), "cols\n")
+```
+
+
+Validasi Duplikat
+```{r}
+# Hitung jumlah baris dengan Object Name yang duplikat
+dups <- sum(duplicated(df$`Object Name`))
+
+cat("Duplicated Object Names:", dups, "\n")
+```
+Dataset Info
+```{r}
+cat("\n=== INFO (Merged Data) ===\n")
+glimpse(df)
+```
+
+Missing Value per Kolom 
+```{r}
+cat("\n=== Missing Values per Column ===\n")
+print(colSums(is.na(df)))
+```
+
+Tampilan Komlom Penting 
+```{r}
+# Daftar kolom penting
+important_cols <- c(
+  "Object Name",
+  "Cumulative Impact Probability",
+  "Possible Impacts",
+  "Asteroid Velocity",
+  "Asteroid Magnitude",
+  "Asteroid Diameter (km)",
+  "Impact Energy (Mt)",
+  "Orbit Eccentricity",
+  "Orbit Inclination (deg)",
+  "Orbit Axis (AU)",
+  "Minimum Orbit Intersection Distance (AU)"
+)
+
+# Cek apakah kolom penting ada di df
+available <- important_cols[important_cols %in% names(df)]
+
+cat("\n=== Kolom yang akan digunakan ===\n")
+for (c in available) {
+  cat(" ", c, "\n")
+}
+```
+
+# Pahami struktur & cek kualitas data
+Merge Diagnostics
+```{r}
+library(dplyr)
+
+cat("=== MERGE DIAGNOSTICS ===\n\n")
+
+# 1) Tampilkan struktur kolom orbits.csv
+
+cat("Kolom di orbits.csv:\n")
+print(names(orbits))
+
+cat("\n5 baris pertama orbits.csv:\n")
+print(head(orbits, 5))   # setara display(orbits.head())
+```
+```{r}
+# 2) Cek apakah ada kolom kandidat nama asteroid
+
+possible_keys <- c(
+  "Object Name", "Object", "fullname", "Full Name",
+  "Designation", "Asteroid", "Asteroid Name",
+  "Neo", "name", "full_name"
+)
+
+found_keys <- possible_keys[possible_keys %in% names(orbits)]
+
+if (length(found_keys) == 0) {
+  cat("\nTidak ditemukan kolom nama objek yang cocok di orbits.csv.\n")
+  cat("Merge dengan impacts.csv pasti gagal karena tidak ada key yang sesuai.\n")
+} else {
+  cat("\nKolom kandidat untuk merge ditemukan:\n")
+  print(found_keys)
+}
+```
+
+List Kolom Merge 
+```{r}
+cat("\n=== LIST KOLOM df ===\n")
+print(names(df))
+
+cat("Total kolom:", length(names(df)), "\n")
+```
+
+Missing Value Check
+```{r}
+library(dplyr)
+
+cat("\n=== MISSING VALUES (df) ===\n")
+
+# Missing per kolom, diurutkan menurun
+missing <- sort(colSums(is.na(df)), decreasing = TRUE)
+print(missing)
+
+# daftar kolom orbit
+orbit_cols <- c(
+  "Orbit Axis (AU)", 
+  "Orbit Eccentricity", 
+  "Orbit Inclination (deg)",
+  "Minimum Orbit Intersection Distance (AU)", 
+  "Perihelion Distance (AU)",
+  "Aphelion Distance (AU)", 
+  "Orbital Period (yr)"
+)
+
+# cek apakah semua kolom orbit NA total
+cols_yang_ada <- orbit_cols[orbit_cols %in% names(df)]
+
+all_orbit_nan <- all(sapply(cols_yang_ada, function(col) {
+  sum(is.na(df[[col]])) == nrow(df)
+}))
+
+if (all_orbit_nan) {
+  cat("\nWARNING: Semua fitur orbit = NA → MERGE GAGAL 100%.\n")
+  cat("SEBELUM modeling, perbaiki MERGE terlebih dahulu!\n\n")
+}
+```
+```{r}
+library(ggplot2)
+
+missing_df <- data.frame(
+  kolom = names(missing),
+  missing = as.numeric(missing)
+)
+
+ggplot(missing_df, aes(x = missing, y = reorder(kolom, missing))) +
+  geom_bar(stat = "identity", fill = "steelblue") +
+  labs(
+    title = "Missing Value per Kolom",
+    x = "Jumlah Missing",
+    y = "Kolom"
+  ) +
+  theme_minimal()
+```
+
+Descriptive Statistics
+```{r}
+install.packages("skimr")
+library(skimr)
+
+cat("\n=== DESCRIPTIVE STATISTICS (NUMERIK) ===\n")
+skim(df)
+```
+
+Distribusi Fitur Utama
+```{r}
+cat("\n=== DISTRIBUSI FITUR (Histogram + KDE) ===\n")
+
+# list fitur utama
+main_features <- c(
+  "Asteroid Velocity",
+  "Asteroid Magnitude_x",
+  "Asteroid Diameter (km)",
+  "Impact Energy (Mt)",
+  "Possible Impacts",
+  "Cumulative Impact Probability"
+)
+
+# cek kolom yang tersedia di df
+available <- main_features[main_features %in% names(df)]
+
+# loop tiap kolom
+for (col in available) {
+  
+  data <- df[[col]]
+  data <- data[!is.na(data)]   # drop NA
+  
+  # buka jendela plot (opsional)
+  # windows(width = 7, height = 4)  # untuk Windows
+  
+  # histogram
+  hist(
+    data,
+    breaks = 30,
+    freq = FALSE,                   # density = TRUE
+    col = rgb(0.2, 0.5, 0.8, 0.4),  # mirip alpha=0.5
+    border = "black",
+    main = paste("Distribusi", col),
+    xlab = col,
+    ylab = "Density"
+  )
+  
+  # KDE menggunakan density()
+  kde <- density(data, na.rm = TRUE)
+  lines(kde, lwd = 2, col = "blue")
+  
+  grid()   # sama seperti plt.grid(True)
+}
+```
+
+Distribusi Log Probability 
+```{r}
+library(ggplot2)
+
+if ("Cumulative Impact Probability" %in% names(df)) {
+  
+  cip <- df[["Cumulative Impact Probability"]]
+  cip[cip == 0] <- NA
+  
+  log_cip <- log10(cip)
+  log_cip <- log_cip[!is.na(log_cip)]
+  
+  ggplot(data.frame(log_cip), aes(log_cip)) +
+    geom_histogram(bins = 40, fill = "orange", color = "black") +
+    ggtitle("Distribusi log10(Cumulative Impact Probability)") +
+    xlab("log10(prob)") +
+    ylab("Frekuensi") +
+    theme_minimal()
+}
+```
+
+
+Heatmap Korelasi 
+```{r}
+library(ggplot2)
+library(reshape2)
+
+# Ambil kolom numerik
+numeric_df <- df[, sapply(df, is.numeric)]
+numeric_df <- numeric_df[, colSums(!is.na(numeric_df)) > 0]
+
+# Korelasi
+corr <- cor(numeric_df, use = "pairwise.complete.obs")
+
+# Reshape
+corr_melt <- melt(corr)
+
+# Heatmap versi cantik
+ggplot(corr_melt, aes(Var1, Var2, fill = value)) +
+  geom_tile(color = "white", linewidth = 0.3) +             # garis kotak tipis
+  scale_fill_gradient2(
+    low = "#4575b4", high = "#d73027", mid = "white",
+    midpoint = 0, limit = c(-1,1), space = "Lab",
+    name = "Correlation"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    axis.text.x = element_text(angle = 45, vjust = 1, hjust = 1, size = 8),
+    axis.text.y = element_text(size = 8),
+    axis.title = element_blank(),
+    panel.grid = element_blank(),
+    plot.title = element_text(size = 14, face = "bold", hjust = 0.5)
+  ) +
+  ggtitle("Correlation Heatmap")
+```
+
+Range Fitur Orbit
+```{r}
+cat("\n=== RANGE ORBIT FEATURES ===\n")
+
+for (col in orbit_cols) {
+  if (col %in% names(df)) {
+    
+    # jumlah non-NA
+    non_na_count <- sum(!is.na(df[[col]]))
+    
+    if (non_na_count > 0) {
+      cat(sprintf("%-40s → %s  to  %s\n",
+                  col,
+                  min(df[[col]], na.rm = TRUE),
+                  max(df[[col]], na.rm = TRUE)))
+    } else {
+      cat(sprintf("%-40s → All NA (merge gagal)\n", col))
+    }
+  }
+}
+```
+
+# Preprosesing Data
+Normalisasi Nama Objek & Merge
+```{r}
+library(dplyr)
+
+
+# Fungsi normalize_name 
+
+normalize_name <- function(s) {
+  s <- gsub("\u00A0", " ", as.character(s))  # replace non-breaking space
+  s <- trimws(s)                             # strip
+  
+  # Ambil isi dalam kurung
+  if (grepl("\\(", s) && grepl("\\)", s)) {
+    s <- sub(".*\\((.*)\\).*", "\\1", s)
+  }
+  
+  # Bersihkan sisa kurung dan spasi ganda
+  s <- gsub("\\(", "", s)
+  s <- gsub("\\)", "", s)
+  s <- gsub("\\s+", " ", s)
+  s <- trimws(s)
+  
+  return(s)
+}
+
+# Buat kolom obj_key
+
+impacts$obj_key <- sapply(impacts$`Object Name`, normalize_name)
+orbits$obj_key  <- sapply(orbits$`Object Name`, normalize_name)
+
+
+# Merge dataset
+orbits_clean <- orbits %>% select(-`Object Name`)
+
+df <- impacts %>%
+  left_join(orbits_clean, by = "obj_key", suffix = c("_imp", "_orb"))
+
+cat("Merge success:", nrow(df), "rows,", ncol(df), "cols\n")
+```
+
+DROP LEAKAGE FEATURES
+```{r}
+# daftar kolom leakage
+leak_cols <- c(
+  "Cumulative Impact Probability",
+  "Cumulative Palermo Scale",
+  "Maximum Palermo Scale",
+  "Maximum Torino Scale"
+)
+
+# hapus kolom
+df <- df[, !(names(df) %in% leak_cols)]
+```
+
+HANDLE MISSING
+```{r}
+orbit_cols <- c(
+  "Orbit Axis (AU)", "Orbit Eccentricity", "Orbit Inclination (deg)",
+  "Minimum Orbit Intersection Distance (AU)",
+  "Perihelion Distance (AU)", "Aphelion Distance (AU)",
+  "Orbital Period (yr)"
+)
+
+# Hapus baris yang memiliki NA di kolom orbit
+df <- df[complete.cases(df[, orbit_cols]), ]
+```
+
+# FEATURE ENGINEERING
+LOG TRANSFORMATION
+```{r}
+# 1. log_diameter
+df$log_diameter <- log1p(df[["Asteroid Diameter (km)"]])
+
+# 2. log_velocity
+df$log_velocity <- log1p(df[["Asteroid Velocity"]])
+
+# 3. log_impacts
+df$log_impacts  <- log1p(df[["Possible Impacts"]])
+
+# 4. Impact Energy (jika belum ada → buat)
+if (!("Impact Energy (Mt)" %in% names(df))) {
+  df[["Impact Energy (Mt)"]] <- 
+    df[["Asteroid Diameter (km)"]]^3 * (df[["Asteroid Velocity"]]^2)
+}
+
+# 5. log_energy
+df$log_energy <- log1p(df[["Impact Energy (Mt)"]])
+
+cat("Log transformation selesai.\n")
+```
+
+Interaction Features
+```{r}
+# 1. Diameter × Velocity
+df$diameter_x_velocity <- df[["Asteroid Diameter (km)"]] * df[["Asteroid Velocity"]]
+
+# 2. Diameter × Possible Impacts
+df$diameter_x_impacts <- df[["Asteroid Diameter (km)"]] * df[["Possible Impacts"]]
+
+# 3. Velocity × Possible Impacts
+df$velocity_x_impacts <- df[["Asteroid Velocity"]] * df[["Possible Impacts"]]
+
+# 4. Velocity × MOID
+df$velocity_x_MOID <- df[["Asteroid Velocity"]] * df[["Minimum Orbit Intersection Distance (AU)"]]
+
+# 5. Diameter × MOID
+df$diameter_x_MOID <- df[["Asteroid Diameter (km)"]] * df[["Minimum Orbit Intersection Distance (AU)"]]
+
+# 6. Energy × MOID (buat energi jika belum ada)
+if (!("Impact Energy (Mt)" %in% names(df))) {
+  df[["Impact Energy (Mt)"]] <- df[["Asteroid Diameter (km)"]]^3 * (df[["Asteroid Velocity"]]^2)
+}
+
+df$energy_x_MOID <- df[["Impact Energy (Mt)"]] * df[["Minimum Orbit Intersection Distance (AU)"]]
+
+cat("Interaction features selesai dibuat.\n")
+```
+
+Polynomial Features (degree 2)
+```{r}
+# Orbit eccentricity squared
+df$ecc2 <- df[["Orbit Eccentricity"]] ^ 2
+
+# Inclination squared
+df$incl2 <- df[["Orbit Inclination (deg)"]] ^ 2
+
+# Orbit axis squared
+df$axis2 <- df[["Orbit Axis (AU)"]] ^ 2
+
+# Velocity squared
+df$velocity2 <- df[["Asteroid Velocity"]] ^ 2
+
+# Diameter squared
+df$diameter2 <- df[["Asteroid Diameter (km)"]] ^ 2
+
+# MOID squared
+df$moid2 <- df[["Minimum Orbit Intersection Distance (AU)"]] ^ 2
+
+cat("Polynomial features (degree 2) selesai dibuat.\n")
+```
+
+Orbit Dynamics Features
+```{r}
+# 1. Perihelion / Aphelion ratio
+df$peri_to_aphe_ratio <- df[["Perihelion Distance (AU)"]] / df[["Aphelion Distance (AU)"]]
+
+# 2. Sin dari inclination (konversi derajat → radian)
+df$incl_sin <- sin(df[["Orbit Inclination (deg)"]] * pi / 180)
+
+# 3. Cos dari inclination
+df$incl_cos <- cos(df[["Orbit Inclination (deg)"]] * pi / 180)
+
+# 4. Normalized perihelion distance
+df$peri_norm <- df[["Perihelion Distance (AU)"]] / df[["Orbit Axis (AU)"]]
+
+# 5. Normalized aphelion distance
+df$aphe_norm <- df[["Aphelion Distance (AU)"]] / df[["Orbit Axis (AU)"]]
+
+cat("Orbit dynamics features selesai dibuat.\n")
+```
+
+# PEMILIHAN FITUR UNTUK MODEL
+```{r}
+feature_list <- c(
+
+  # Log-transformed features
+  "log_diameter",
+  "log_velocity",
+  "log_impacts",
+  "log_energy",
+
+  # Orbit features (inti)
+  "Orbit Axis (AU)",
+  "Orbit Eccentricity",
+  "Orbit Inclination (deg)",
+  "Minimum Orbit Intersection Distance (AU)",
+  "Perihelion Distance (AU)",
+  "Aphelion Distance (AU)",
+  "Orbital Period (yr)",
+
+  # Interaction features
+  "diameter_x_velocity",
+  "diameter_x_impacts",
+  "velocity_x_impacts",
+  "velocity_x_MOID",
+  "diameter_x_MOID",
+  "energy_x_MOID",
+
+  # Polynomial features
+  "ecc2",
+  "incl2",
+  "axis2",
+  "velocity2",
+  "diameter2",
+  "moid2",
+
+  # Orbit dynamics features
+  "peri_to_aphe_ratio",
+  "incl_sin",
+  "incl_cos",
+  "peri_norm",
+  "aphe_norm"
+)
+```
+
+Pastikan hanya fitur yang benar-benar ada di df
+```{r}
+# Pilih fitur yang benar-benar ada di df
+available_features <- feature_list[feature_list %in% names(df)]
+
+cat("Fitur akhir yang digunakan untuk X:\n")
+for (f in available_features) {
+  cat("-", f, "\n")
+}
+```
+
+BUAT TARGET HighRisk
+```{r}
+# 1. Buat kolom HighRisk
+df$HighRisk <- as.integer(
+  (df[["Possible Impacts"]] >= 10) |
+    ((df[["Asteroid Diameter (km)"]] >= 0.05) &
+       (df[["Minimum Orbit Intersection Distance (AU)"]] < 0.01)) |
+    ((df[["Impact Energy (Mt)"]] > median(df[["Impact Energy (Mt)"]], na.rm = TRUE)) &
+       (df[["Asteroid Velocity"]] > median(df[["Asteroid Velocity"]], na.rm = TRUE)))
+)
+
+# 2. Tampilkan distribusi
+cat("Distribusi HighRisk:\n")
+print(table(df$HighRisk))
+```
+
+Susun X dan y
+```{r}
+# Buat X dan y
+X <- df[, available_features, drop = FALSE]
+y <- as.integer(df$HighRisk)
+
+# Print shape
+cat("Shape X:", nrow(X), "rows,", ncol(X), "cols\n")
+cat("Shape y:", length(y), "\n")
+```
+
+Validasi
+```{r}
+# Total missing dalam X
+total_missing <- sum(is.na(X))
+cat("Total missing dalam X:", total_missing, "\n\n")
+
+# Distribusi y
+cat("Distribusi y:\n")
+print(table(y))
+```
+
+# Train–Test Split
+```{r}
+library(caret)
+
+set.seed(42)   # sama seperti random_state=42
+
+# Stratified split seperti train_test_split(..., stratify=y)
+idx_train <- createDataPartition(y, p = 0.80, list = FALSE)
+
+X_train <- X[idx_train, , drop = FALSE]
+X_test  <- X[-idx_train, , drop = FALSE]
+
+y_train <- y[idx_train]
+y_test  <- y[-idx_train]
+```
+```{r}
+cat("=== Split Completed ===\n")
+cat("Train size :", nrow(X_train), "\n")
+cat("Test size  :", nrow(X_test), "\n\n")
+
+cat("Distribusi kelas di TRAIN:\n")
+print(table(y_train))
+
+cat("\nDistribusi kelas di TEST:\n")
+print(table(y_test))
+```
+
+# SCALING
+```{r}
+library(caret)
+
+# buat scaler (hanya pada data training)
+preproc <- preProcess(X_train, method = c("center", "scale"))
+
+# scaling training set
+X_train_scaled <- predict(preproc, X_train)
+
+# scaling test set (pakai scaler yang sama)
+X_test_scaled  <- predict(preproc, X_test)
+
+cat("=== Scaling Done ===\n")
+cat("X_train_scaled shape:", nrow(X_train_scaled), "rows,", ncol(X_train_scaled), "cols\n")
+cat("X_test_scaled  shape:", nrow(X_test_scaled), "rows,", ncol(X_test_scaled), "cols\n")
+```
+
+# Imbalance Handling
+```{r}
+library(smotefamily)
+
+# Ubah y menjadi faktor
+y_train_factor <- as.factor(y_train)
+
+# Gabungkan X dan y
+train_df <- data.frame(X_train_scaled, HighRisk = y_train_factor)
+
+# Terapkan SMOTE
+smote_result <- SMOTE(train_df[, -ncol(train_df)],
+                      train_df$HighRisk,
+                      K = 5)
+
+# Ambil hasil SMOTE
+X_train_final <- smote_result$data[, -ncol(smote_result$data)]
+y_train_final <- smote_result$data$class
+
+# Output distribusi
+cat("Distribusi baru:\n")
+print(table(y_train_final))
+
+cat("Shape X_train_final:", nrow(X_train_final),
+    "rows,", ncol(X_train_final), "cols\n")
+cat("Shape y_train_final:", length(y_train_final), "\n")
+```
+
+
+# Training Logistic Regression + HPO (GridSearch)
+Definisikan Model Logistic Regression
+```{r}
+model_lr <- train(
+  x = X_train_final,
+  y = factor(y_train_final, levels = c(0,1), labels = c("neg","pos")),
+  method = "glm",
+  family = "binomial",
+  trControl = trainControl(
+    method = "cv",
+    number = 5,
+    classProbs = TRUE,
+    summaryFunction = twoClassSummary
+  ),
+  control = glm.control(maxit = 500),
+  metric = "ROC"
+)
+```
+
+GRID SEARCH GLMNET
+```{r}
+# Grid Search untuk glmnet
+
+X_mat <- as.matrix(X_train_final)
+y_vec <- as.numeric(y_train_final)
+
+best_auc <- -Inf
+best_model <- NULL
+best_alpha <- NULL
+best_lambda <- NULL
+
+for (alpha_val in alpha_grid) {
+  for (lambda_val in lambda_grid) {
+    
+    # Train model
+    fit <- glmnet(
+      X_mat, y_vec,
+      family = "binomial",
+      alpha = alpha_val,     # 0=ridge, 1=lasso
+      lambda = lambda_val,   # sama dengan C=1/lambda
+      weights = weights_balanced
+    )
+    
+    # Probabilitas prediksi pada training set
+    pred_prob <- predict(fit, X_mat, type = "response")
+    
+    # Hitung AUC
+    auc_val <- pROC::auc(y_vec, pred_prob)
+    
+    # Update jika model lebih baik
+    if (auc_val > best_auc) {
+      best_auc <- auc_val
+      best_model <- fit
+      best_alpha <- alpha_val
+      best_lambda <- lambda_val
+    }
+  }
+}
+
+cat("=== GRID SEARCH COMPLETED ===\n")
+cat("Best AUC:", best_auc, "\n")
+cat("Best alpha (0=ridge,1=lasso):", best_alpha, "\n")
+cat("Best lambda:", best_lambda, "\n")
+```
+
+# Evaluasi Model di Test Set
+```{r}
+# Ubah X_test ke matrix (glmnet butuh matrix)
+X_test_mat <- as.matrix(X_test_scaled)
+
+# Probabilitas kelas positif (y_prob)
+y_prob <- as.numeric(predict(best_model, X_test_mat, type = "response"))
+
+# Prediksi kelas (y_pred)
+y_pred <- ifelse(y_prob > 0.5, 1, 0)
+
+```
+
+```{r}
+library(pROC)
+
+# 1. ROC TRAIN
+
+y_prob_train <- as.numeric(predict(best_model, as.matrix(X_train_final), type = "response"))
+roc_train <- roc(y_train_final, y_prob_train)
+auc_train <- auc(roc_train)
+
+# 2. ROC TEST
+
+y_prob_test <- as.numeric(predict(best_model, as.matrix(X_test_scaled), type = "response"))
+roc_test <- roc(y_test, y_prob_test)
+auc_test <- auc(roc_test)
+
+# 3. Plot ROC Train vs Test
+
+plot(roc_train,
+     col = "#1f77b4",
+     lwd = 3,
+     main = "ROC Curve — Train vs Test",
+     legacy.axes = TRUE)
+
+lines(roc_test,
+      col = "#ff7f0e",
+      lwd = 3,
+      lty = 2)
+
+abline(a = 0, b = 1, col = "gray", lty = 2)
+
+legend("bottomright",
+       legend = c(
+         paste0("Train AUC = ", round(auc_train, 3)),
+         paste0("Test AUC  = ", round(auc_test, 3))
+       ),
+       col = c("#1f77b4", "#ff7f0e"),
+       lwd = 3,
+       lty = c(1, 2)
+)
+
+```
+
+Confusion Matrix
+```{r}
+library(caret)
+library(ggplot2)
+
+cat("\n=== CONFUSION MATRIX ===\n")
+
+# Confusion matrix angka
+cm <- table(
+  Actual = y_test,
+  Predicted = y_pred
+)
+
+print(cm)
+
+# Ubah menjadi data frame untuk ggplot
+cm_df <- as.data.frame(cm)
+colnames(cm_df) <- c("Actual", "Predicted", "Freq")
+
+# Plot heatmap confusion matrix
+ggplot(cm_df, aes(x = Predicted, y = Actual, fill = Freq)) +
+  geom_tile(color = "white") +
+  geom_text(aes(label = Freq), color = "black", size = 6) +
+  scale_fill_gradient(low = "#DCE6F2", high = "#08306B") +
+  labs(
+    title = "Confusion Matrix Heatmap",
+    x = "Predicted Class",
+    y = "Actual Class"
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(
+    plot.title = element_text(size = 16, face = "bold", hjust = 0.5),
+    axis.text = element_text(size = 12),
+    legend.position = "right"
+  )
+```
+
+Classification Report\
+```{r}
+library(caret)
+
+cat("\n=== CLASSIFICATION REPORT ===\n")
+
+# Buat faktor dengan level 0 dan 1
+pred_factor <- factor(y_pred, levels = c(0,1))
+test_factor <- factor(y_test, levels = c(0,1))
+
+# Confusion Matrix + Metrics
+cm <- confusionMatrix(pred_factor, test_factor, positive = "1")
+
+print(cm)
+```
+
+ROC-AUC Test
+```{r}
+library(pROC)
+
+cat("\n=== ROC-AUC (TEST SET) ===\n")
+
+roc_test <- roc(y_test, y_prob)
+auc_test <- auc(roc_test)
+
+cat("AUC:", auc_test, "\n")
+```
+
+Cek Koefisien Model
+```{r}
+library(glmnet)
+library(dplyr)
+
+# ambil koefisien dari model terbaik (glmnet)
+coef_raw <- coef(best_model)
+
+# ubah ke vector biasa (drop sparse format)
+coef_vec <- as.numeric(coef_raw)
+
+# glmnet menyimpan intercept sebagai koefisien pertama
+intercept <- coef_vec[1]
+coef_values <- coef_vec[-1]   # sisakan koef fitur saja
+
+# membuat dataframe koefisien fitur
+coef_df <- data.frame(
+  feature = available_features,
+  coef = coef_values
+) %>%
+  arrange(desc(coef))
+
+cat("=== Koefisien Fitur Logistic Regression (glmnet) ===\n")
+print(coef_df)
+```
